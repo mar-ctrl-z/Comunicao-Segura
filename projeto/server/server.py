@@ -1,386 +1,225 @@
+import socket
+import threading
 import sqlite3
 import hashlib
-import secrets
-import os
-import logging
-from datetime import datetime, timedelta
-from flask import Flask, request, jsonify
+import uuid
+import json
+import base64
+from datetime import datetime
 from cryptography.fernet import Fernet
 
-# -------------------------------------------------------------------
-# Configuração geral
-# -------------------------------------------------------------------
+# Configurações de Rede (Escuta em todas as interfaces para permitir múltiplos PCs)
+HOST = '0.0.0.0'
+PORT = 5555
 
-app = Flask(__name__)
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(levelname)s] %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-log = logging.getLogger(__name__)
+# Chave Simétrica Compartilhada (Gerada a partir de 32 bytes estáticos para simplificação)
+SHARED_KEY = base64.urlsafe_b64encode(b"chave_secreta_com_32_bytes_comp!")
+fernet = Fernet(SHARED_KEY)
 
-CHAVE_FERNET = b'ZmDfcTF7_60GrrY167zsiPd67pEvs0aGOv2oasOM1Pg='
-fernet = Fernet(CHAVE_FERNET)
-
-DB_PATH = os.path.join(os.path.dirname(__file__), 'mensagens.db')
-SESSAO_EXPIRA_MIN = 30  # tokens expiram após 30 minutos de inatividade
-
-# token -> {'username': str, 'criado_em': datetime}
-sessoes = {}
-
-
-# -------------------------------------------------------------------
-# Banco de dados
-# -------------------------------------------------------------------
-
-def get_db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+# Dicionário em memória para gerenciar sessões ativas {token: {"username": ..., "role": ...}}
+active_sessions = {}
 
 def init_db():
-    conn = get_db()
-    c = conn.cursor()
-
-    c.execute('''
+    """Inicializa o banco de dados e cria usuários padrão caso não existam."""
+    conn = sqlite3.connect('sistema_seguro.db')
+    cursor = conn.cursor()
+    
+    # Tabela de Usuários
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS usuarios (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            username    TEXT UNIQUE NOT NULL,
-            senha_hash  TEXT NOT NULL,
-            papel       TEXT NOT NULL DEFAULT 'user'
+            username TEXT PRIMARY KEY,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL
         )
     ''')
-
-    c.execute('''
+    
+    # Tabela de Mensagens conforme especificação
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS mensagens (
-            id               INTEGER PRIMARY KEY AUTOINCREMENT,
-            remetente        TEXT NOT NULL,
-            destinatario     TEXT NOT NULL,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            remetente TEXT NOT NULL,
+            destinatario TEXT NOT NULL,
             conteudo_cifrado BLOB NOT NULL,
-            timestamp        TEXT NOT NULL,
-            lida             INTEGER DEFAULT 0
+            timestamp TEXT NOT NULL,
+            lida INTEGER NOT NULL
         )
     ''')
-
-    usuarios_padrao = [
-        ('admin', 'admin123', 'admin'),
-        ('alice', 'alice123', 'user'),
-        ('bob',   'bob123',   'user'),
+    
+    # Inserção de usuários de teste (Senhas: admin123, userA123, userB123)
+    users_to_create = [
+        ('admin', hashlib.sha256(b'admin123').hexdigest(), 'admin'),
+        ('userA', hashlib.sha256(b'userA123').hexdigest(), 'user'),
+        ('userB', hashlib.sha256(b'userB123').hexdigest(), 'user')
     ]
-    for username, senha, papel in usuarios_padrao:
-        h = hashlib.sha256(senha.encode()).hexdigest()
+    
+    for username, p_hash, role in users_to_create:
         try:
-            c.execute(
-                'INSERT INTO usuarios (username, senha_hash, papel) VALUES (?, ?, ?)',
-                (username, h, papel)
-            )
-            log.info(f'Usuário padrão criado: {username} ({papel})')
+            cursor.execute('INSERT INTO usuarios VALUES (?, ?, ?)', (username, p_hash, role))
         except sqlite3.IntegrityError:
-            pass
-
+            pass # Usuário já existe
+            
     conn.commit()
     conn.close()
 
-
-# -------------------------------------------------------------------
-# Helpers de sessão
-# -------------------------------------------------------------------
-
-def _limpar_sessoes_expiradas():
-    expiradas = [
-        t for t, dados in sessoes.items()
-        if datetime.utcnow() - dados['criado_em'] > timedelta(minutes=SESSAO_EXPIRA_MIN)
-    ]
-    for t in expiradas:
-        log.info(f'Sessão expirada removida: usuário={sessoes[t]["username"]}')
-        del sessoes[t]
-
-
-def usuario_da_sessao(token):
-    _limpar_sessoes_expiradas()
-    entrada = sessoes.get(token)
-    if not entrada:
-        return None
-    # Renova o tempo a cada requisição (sliding window)
-    entrada['criado_em'] = datetime.utcnow()
-    return entrada['username']
-
-
-def get_papel(username):
-    conn = get_db()
-    row = conn.execute('SELECT papel FROM usuarios WHERE username = ?', (username,)).fetchone()
-    conn.close()
-    return row['papel'] if row else None
-
-
-def _token_do_header():
-    return request.headers.get('Authorization', '').replace('Bearer ', '').strip()
-
-
-# -------------------------------------------------------------------
-# Autenticação
-# -------------------------------------------------------------------
-
-@app.route('/login', methods=['POST'])
-def login():
-    ip = request.remote_addr
-    dados = request.get_json(silent=True) or {}
-    username = dados.get('username', '').strip()
-    senha    = dados.get('senha', '')
-
-    if not username or not senha:
-        log.warning(f'Tentativa de login sem credenciais completas | IP={ip}')
-        return jsonify({'erro': 'Username e senha são obrigatórios'}), 400
-
-    senha_hash = hashlib.sha256(senha.encode()).hexdigest()
-
-    conn = get_db()
-    row = conn.execute(
-        'SELECT * FROM usuarios WHERE username = ? AND senha_hash = ?',
-        (username, senha_hash)
-    ).fetchone()
-    conn.close()
-
-    if not row:
-        log.warning(f'Falha de login para "{username}" | IP={ip}')
-        return jsonify({'erro': 'Credenciais inválidas'}), 401
-
-    token = secrets.token_hex(32)
-    sessoes[token] = {'username': username, 'criado_em': datetime.utcnow()}
-    log.info(f'Login bem-sucedido: {username} ({row["papel"]}) | IP={ip}')
-
-    return jsonify({
-        'token': token,
-        'papel': row['papel'],
-        'expira_em_min': SESSAO_EXPIRA_MIN,
-        'mensagem': f'Bem-vindo, {username}!'
-    })
-
-
-@app.route('/logout', methods=['POST'])
-def logout():
-    token = _token_do_header()
-    username = usuario_da_sessao(token)
-    if username:
-        del sessoes[token]
-        log.info(f'Logout: {username}')
-    return jsonify({'mensagem': 'Sessão encerrada'})
-
-
-# -------------------------------------------------------------------
-# Mensagens
-# -------------------------------------------------------------------
-
-@app.route('/mensagem/enviar', methods=['POST'])
-def enviar_mensagem():
-    token     = _token_do_header()
-    remetente = usuario_da_sessao(token)
-    if not remetente:
-        return jsonify({'erro': 'Não autenticado ou sessão expirada'}), 401
-
-    dados        = request.get_json(silent=True) or {}
-    destinatario = dados.get('destinatario', '').strip()
-    conteudo     = dados.get('conteudo', '').strip()
-
-    if not destinatario or not conteudo:
-        return jsonify({'erro': 'Destinatário e conteúdo são obrigatórios'}), 400
-
-    conn = get_db()
-    dest_row = conn.execute(
-        'SELECT username FROM usuarios WHERE username = ?', (destinatario,)
-    ).fetchone()
-
-    if not dest_row:
-        conn.close()
-        return jsonify({'erro': f'Usuário "{destinatario}" não encontrado'}), 404
-
-    conteudo_cifrado = fernet.encrypt(conteudo.encode())
-    timestamp = datetime.utcnow().isoformat()
-
-    conn.execute(
-        'INSERT INTO mensagens (remetente, destinatario, conteudo_cifrado, timestamp, lida) VALUES (?, ?, ?, ?, 0)',
-        (remetente, destinatario, conteudo_cifrado, timestamp)
-    )
-    conn.commit()
-    conn.close()
-
-    log.info(f'Mensagem enviada: {remetente} -> {destinatario}')
-    return jsonify({
-        'mensagem': 'Mensagem enviada com sucesso',
-        'timestamp': timestamp,
-        'bytes_cifrados': len(conteudo_cifrado)
-    })
-
-
-@app.route('/mensagem/caixa-de-entrada', methods=['GET'])
-def caixa_de_entrada():
-    token    = _token_do_header()
-    username = usuario_da_sessao(token)
-    if not username:
-        return jsonify({'erro': 'Não autenticado ou sessão expirada'}), 401
-
-    conn = get_db()
-    rows = conn.execute(
-        'SELECT * FROM mensagens WHERE destinatario = ? ORDER BY timestamp DESC',
-        (username,)
-    ).fetchall()
-
-    resultado = []
-    for row in rows:
-        conteudo = fernet.decrypt(row['conteudo_cifrado']).decode()
-        conn.execute('UPDATE mensagens SET lida = 1 WHERE id = ?', (row['id'],))
-        resultado.append({
-            'id':        row['id'],
-            'remetente': row['remetente'],
-            'conteudo':  conteudo,
-            'timestamp': row['timestamp'],
-            'lida':      row['lida'],
-        })
-
-    conn.commit()
-    conn.close()
-    log.info(f'Caixa de entrada acessada por: {username} ({len(resultado)} mensagem(ns))')
-    return jsonify({'mensagens': resultado, 'total': len(resultado)})
-
-
-@app.route('/mensagem/enviadas', methods=['GET'])
-def mensagens_enviadas():
-    token    = _token_do_header()
-    username = usuario_da_sessao(token)
-    if not username:
-        return jsonify({'erro': 'Não autenticado ou sessão expirada'}), 401
-
-    conn = get_db()
-    rows = conn.execute(
-        'SELECT id, destinatario, timestamp, lida FROM mensagens WHERE remetente = ? ORDER BY timestamp DESC',
-        (username,)
-    ).fetchall()
-    conn.close()
-
-    resultado = [
-        {
-            'id':          row['id'],
-            'destinatario': row['destinatario'],
-            'timestamp':   row['timestamp'],
-            'lida':        bool(row['lida']),
-        }
-        for row in rows
-    ]
-    return jsonify({'enviadas': resultado, 'total': len(resultado)})
-
-
-@app.route('/mensagem/todas', methods=['GET'])
-def todas_mensagens():
-    token    = _token_do_header()
-    username = usuario_da_sessao(token)
-    if not username:
-        return jsonify({'erro': 'Não autenticado ou sessão expirada'}), 401
-
-    if get_papel(username) != 'admin':
-        log.warning(f'Acesso negado a /mensagem/todas: usuário={username}')
-        return jsonify({'erro': 'Acesso negado — somente administradores'}), 403
-
-    conn = get_db()
-    rows = conn.execute('SELECT * FROM mensagens ORDER BY timestamp DESC').fetchall()
-    conn.close()
-
-    resultado = []
-    for row in rows:
-        conteudo = fernet.decrypt(row['conteudo_cifrado']).decode()
-        resultado.append({
-            'id':          row['id'],
-            'remetente':   row['remetente'],
-            'destinatario': row['destinatario'],
-            'conteudo':    conteudo,
-            'timestamp':   row['timestamp'],
-            'lida':        bool(row['lida']),
-        })
-
-    log.info(f'Admin "{username}" listou todas as mensagens ({len(resultado)})')
-    return jsonify({'mensagens': resultado, 'total': len(resultado)})
-
-
-# -------------------------------------------------------------------
-# Gestão de usuários (admin)
-# -------------------------------------------------------------------
-
-@app.route('/usuario/cadastrar', methods=['POST'])
-def cadastrar_usuario():
-    token    = _token_do_header()
-    solicitante = usuario_da_sessao(token)
-    if not solicitante:
-        return jsonify({'erro': 'Não autenticado ou sessão expirada'}), 401
-
-    if get_papel(solicitante) != 'admin':
-        log.warning(f'Tentativa não autorizada de cadastro por: {solicitante}')
-        return jsonify({'erro': 'Acesso negado — somente administradores podem cadastrar usuários'}), 403
-
-    dados    = request.get_json(silent=True) or {}
-    novo_usr = dados.get('username', '').strip()
-    senha    = dados.get('senha', '')
-    papel    = dados.get('papel', 'user').strip().lower()
-
-    if not novo_usr or not senha:
-        return jsonify({'erro': 'Username e senha são obrigatórios'}), 400
-
-    if len(novo_usr) < 3:
-        return jsonify({'erro': 'Username deve ter pelo menos 3 caracteres'}), 400
-
-    if len(senha) < 6:
-        return jsonify({'erro': 'Senha deve ter pelo menos 6 caracteres'}), 400
-
-    if papel not in ('user', 'admin'):
-        return jsonify({'erro': 'Papel inválido — use "user" ou "admin"'}), 400
-
-    senha_hash = hashlib.sha256(senha.encode()).hexdigest()
-
+def handle_client(client_socket):
+    """Gerencia a comunicação individual com cada cliente via protocolo JSON."""
+    buffer = ""
     try:
-        conn = get_db()
-        conn.execute(
-            'INSERT INTO usuarios (username, senha_hash, papel) VALUES (?, ?, ?)',
-            (novo_usr, senha_hash, papel)
-        )
+        while True:
+            data = client_socket.recv(4096).decode('utf-8')
+            if not data:
+                break
+                
+            buffer += data
+            while '\n' in buffer:
+                line, buffer = buffer.split('\n', 1)
+                if not line.strip():
+                    continue
+                
+                request = json.loads(line)
+                response = process_request(request)
+                client_socket.sendall((json.dumps(response) + '\n').encode('utf-8'))
+    except Exception as e:
+        print(f"[-] Erro na conexão: {e}")
+    finally:
+        client_socket.close()
+
+def process_request(req):
+    action = req.get("action")
+    token = req.get("token")
+    
+    # 1. Fluxo de Autenticação (Não exige Token)
+    if action == "login":
+        username = req.get("username")
+        password = req.get("password")
+        p_hash = hashlib.sha256(password.encode()).hexdigest()
+        
+        conn = sqlite3.connect('sistema_seguro.db')
+        cursor = conn.cursor()
+        cursor.execute('SELECT role FROM usuarios WHERE username=? AND password_hash=?', (username, p_hash))
+        user = cursor.fetchone()
+        conn.close()
+        
+        if user:
+            session_token = str(uuid.uuid4())
+            active_sessions[session_token] = {"username": username, "role": user[0]}
+            return {"status": "success", "token": session_token, "role": user[0], "username": username}
+        return {"status": "error", "message": "Credenciais inválidas. Acesso negado."}
+
+    # Validação do Token para as demais ações
+    if not token or token not in active_sessions:
+        return {"status": "error", "message": "Não autenticado ou token expirado."}
+        
+    session = active_sessions[token]
+    current_user = session["username"]
+    current_role = session["role"]
+
+    conn = sqlite3.connect('sistema_seguro.db')
+    cursor = conn.cursor()
+
+    # 2. Enviar Mensagem (User e Admin podem enviar para qualquer um)
+    if action == "send_msg":
+        dest = req.get("destinatario")
+        conteudo_cifrado_str = req.get("conteudo_cifrado") # String Base64 vinda do cliente
+        
+        # Verificar se destinatário existe
+        cursor.execute('SELECT 1 FROM usuarios WHERE username=?', (dest,))
+        if not cursor.fetchone():
+            conn.close()
+            return {"status": "error", "message": "Destinatário não encontrado."}
+            
+        timestamp = datetime.now().isoformat()
+        cursor.execute('''
+            INSERT INTO mensagens (remetente, destinatario, conteudo_cifrado, timestamp, lida)
+            VALUES (?, ?, ?, ?, 0)
+        ''', (current_user, dest, conteudo_cifrado_str.encode('utf-8'), timestamp))
         conn.commit()
         conn.close()
-        log.info(f'Novo usuário cadastrado por {solicitante}: {novo_usr} ({papel})')
-        return jsonify({'mensagem': f'Usuário "{novo_usr}" cadastrado com sucesso'})
-    except sqlite3.IntegrityError:
-        return jsonify({'erro': f'Username "{novo_usr}" já existe'}), 409
+        return {"status": "success", "message": "Mensagem enviada com sucesso."}
 
+    # 3. Ler Próprias Mensagens (User e Admin)
+    elif action == "read_msgs":
+        cursor.execute('SELECT id, remetente, destinatario, conteudo_cifrado, timestamp FROM mensagens WHERE destinatario=?', (current_user,))
+        rows = cursor.fetchall()
+        
+        msgs = []
+        for r_id, rem, dest, cifrado, ts in rows:
+            # O servidor descriptografa apenas no momento da entrega
+            decrito = fernet.decrypt(cifrado).decode('utf-8')
+            msgs.append({"id": r_id, "remetente": rem, "destinatario": dest, "conteudo": decrito, "timestamp": ts})
+            cursor.execute('UPDATE mensagens SET lida=1 WHERE id=?', (r_id,))
+            
+        conn.commit()
+        conn.close()
+        return {"status": "success", "messages": msgs}
 
-@app.route('/usuario/listar', methods=['GET'])
-def listar_usuarios():
-    token    = _token_do_header()
-    username = usuario_da_sessao(token)
-    if not username:
-        return jsonify({'erro': 'Não autenticado ou sessão expirada'}), 401
+    # 4. Ler Mensagens de Outros (Apenas Admin)
+    elif action == "read_all_msgs":
+        if current_role != "admin":
+            conn.close()
+            return {"status": "error", "message": "Acesso negado: Requer papel de admin."}
+            
+        cursor.execute('SELECT id, remetente, destinatario, conteudo_cifrado, timestamp FROM mensagens')
+        rows = cursor.fetchall()
+        
+        msgs = []
+        for r_id, rem, dest, cifrado, ts in rows:
+            decrito = fernet.decrypt(cifrado).decode('utf-8')
+            msgs.append({"id": r_id, "remetente": rem, "destinatario": dest, "conteudo": decrito, "timestamp": ts})
+            
+        conn.close()
+        return {"status": "success", "messages": msgs}
 
-    if get_papel(username) != 'admin':
-        return jsonify({'erro': 'Acesso negado — somente administradores'}), 403
+    # 5. Cadastrar Novo Usuário (Apenas Admin)
+    elif action == "register_user":
+        if current_role != "admin":
+            conn.close()
+            return {"status": "error", "message": "Acesso negado: Requer papel de admin."}
+            
+        new_user = req.get("new_username")
+        new_pass = req.get("new_password")
+        new_role = req.get("new_role", "user")
+        
+        new_hash = hashlib.sha256(new_pass.encode()).hexdigest()
+        try:
+            cursor.execute('INSERT INTO usuarios VALUES (?, ?, ?)', (new_user, new_hash, new_role))
+            conn.commit()
+            res = {"status": "success", "message": f"Usuário {new_user} cadastrado."}
+        except sqlite3.IntegrityError:
+            res = {"status": "error", "message": "Usuário já existe."}
+        conn.close()
+        return res
 
-    conn = get_db()
-    rows = conn.execute('SELECT username, papel FROM usuarios ORDER BY papel, username').fetchall()
+    # 6. Ver lista de usuários ativos (Apenas Admin)
+    elif action == "list_active":
+        if current_role != "admin":
+            conn.close()
+            return {"status": "error", "message": "Acesso negado: Requer papel de admin."}
+        
+        conn.close()
+        actives = [sess["username"] for sess in active_sessions.values()]
+        return {"status": "success", "active_users": list(set(actives))}
+
     conn.close()
+    return {"status": "error", "message": "Ação desconhecida."}
 
-    ativos = {dados['username'] for dados in sessoes.values()}
-    usuarios = [
-        {
-            'username': r['username'],
-            'papel':    r['papel'],
-            'sessao_ativa': r['username'] in ativos,
-        }
-        for r in rows
-    ]
-    return jsonify({'usuarios': usuarios, 'sessoes_abertas': len(ativos)})
-
-
-# -------------------------------------------------------------------
-# Inicialização
-# -------------------------------------------------------------------
-
-if __name__ == '__main__':
+def main():
     init_db()
-    log.info('Servidor iniciado em http://0.0.0.0:5000')
-    log.info(f'Sessões expiram após {SESSAO_EXPIRA_MIN} minutos de inatividade')
-    app.run(host='0.0.0.0', port=5000, debug=False)
+    server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server.bind((HOST, PORT))
+    server.listen(5)
+    print(f"[*] Servidor de Comunicação Segura rodando na porta {PORT}...")
+    print("[*] Aguardando conexões de rede local...")
+    
+    try:
+        while True:
+            client_sock, addr = server.accept()
+            print(f"[+] Conexão aceita de {addr[0]}:{addr[1]}")
+            threading.Thread(target=handle_client, args=(client_sock,), daemon=True).start()
+    except KeyboardInterrupt:
+        print("\n[-] Desligando o servidor.")
+    finally:
+        server.close()
+
+if __name__ == "__main__":
+    main()

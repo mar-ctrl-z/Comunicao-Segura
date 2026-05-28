@@ -1,285 +1,165 @@
-import requests
-import sys
+import socket
+import json
+import base64
+from cryptography.fernet import Fernet
 
-BASE_URL = 'http://127.0.0.1:5000'
+# Chave Simétrica de Criptografia idêntica à do servidor
+SHARED_KEY = base64.urlsafe_b64encode(b"chave_secreta_com_32_bytes_comp!")
+fernet = Fernet(SHARED_KEY)
 
-token_sessao  = None
-usuario_atual = None
-papel_atual   = None
+PORT = 5555
 
+class SecureClient:
+    def __init__(self, server_ip, server_port):
+        self.server_ip = server_ip
+        self.server_port = server_port
+        self.token = None
+        self.username = None
+        self.role = None
+        self.sock = None
+        self.reader = None
 
-# -------------------------------------------------------------------
-# Utilitários
-# -------------------------------------------------------------------
+    def connect(self):
+        self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.sock.connect((self.server_ip, self.server_port))
+        # Utiliza makefile para ler facilmente linhas terminadas em '\n'
+        self.reader = self.sock.makefile('r', encoding='utf-8')
 
-def cabecalho():
-    return {
-        'Authorization': f'Bearer {token_sessao}',
-        'Content-Type':  'application/json',
-    }
+    def send_request(self, req):
+        if self.token:
+            req["token"] = self.token
+        
+        payload = json.dumps(req) + '\n'
+        self.sock.sendall(payload.encode('utf-8'))
+        
+        response_line = self.reader.readline()
+        if not response_line:
+            return {"status": "error", "message": "Conexão perdida com o servidor."}
+        return json.loads(response_line)
 
+    def login(self, username, password):
+        req = {"action": "login", "username": username, "password": password}
+        res = self.send_request(req)
+        if res.get("status") == "success":
+            self.token = res.get("token")
+            self.username = res.get("username")
+            self.role = res.get("role")
+        return res
 
-def _req(method, rota, **kwargs):
-    """Wrapper que trata erros de conexão de forma uniforme."""
-    try:
-        resp = getattr(requests, method)(f'{BASE_URL}{rota}', **kwargs)
-        return resp
-    except requests.ConnectionError:
-        print('\n[ERRO] Não foi possível conectar ao servidor.')
-        print('       Verifique se server.py está em execução e se BASE_URL está correto.')
-        return None
+    def send_message(self, dest, msg_text):
+        # Criptografa a mensagem localmente antes do envio de rede
+        cipher_bytes = fernet.encrypt(msg_text.encode('utf-8'))
+        cipher_str = cipher_bytes.decode('utf-8') # Converte para string para transitar no JSON
+        
+        req = {"action": "send_msg", "destinatario": dest, "conteudo_cifrado": cipher_str}
+        return self.send_request(req)
 
+    def read_my_messages(self):
+        req = {"action": "read_msgs"}
+        return self.send_request(req)
 
-def separador(titulo=''):
-    largura = 50
-    if titulo:
-        print(f'\n{"─"*3} {titulo} {"─"*(largura - len(titulo) - 5)}')
-    else:
-        print('─' * largura)
+    def admin_read_all(self):
+        req = {"action": "read_all_msgs"}
+        return self.send_request(req)
 
+    def admin_register_user(self, new_user, new_pass, new_role):
+        req = {"action": "register_user", "new_username": new_user, "new_password": new_pass, "new_role": new_role}
+        return self.send_request(req)
 
-# -------------------------------------------------------------------
-# Ações do menu
-# -------------------------------------------------------------------
+    def admin_list_active(self):
+        req = {"action": "list_active"}
+        return self.send_request(req)
 
-def fazer_login():
-    global token_sessao, usuario_atual, papel_atual
-    separador('LOGIN')
-    username = input('Username : ').strip()
-    senha    = input('Senha    : ').strip()
+    def close(self):
+        if self.sock:
+            self.sock.close()
 
-    resp = _req('post', '/login', json={'username': username, 'senha': senha})
-    if resp is None:
-        return
-
-    dados = resp.json()
-    if resp.status_code == 200:
-        token_sessao  = dados['token']
-        usuario_atual = username
-        papel_atual   = dados['papel']
-        print(f'\n  {dados["mensagem"]}')
-        print(f'  Papel   : {papel_atual}')
-        print(f'  Token   : {token_sessao[:24]}...  (expira em {dados["expira_em_min"]} min)')
-    else:
-        print(f'\n  [NEGADO] {dados.get("erro")}')
-
-
-def fazer_logout():
-    global token_sessao, usuario_atual, papel_atual
-    if not token_sessao:
-        print('  Você não está logado.')
-        return
-
-    _req('post', '/logout', headers=cabecalho())
-    print(f'\n  Sessão de "{usuario_atual}" encerrada.')
-    token_sessao  = None
-    usuario_atual = None
-    papel_atual   = None
-
-
-def enviar_mensagem():
-    if not token_sessao:
-        print('\n  Faça login primeiro.')
-        return
-
-    separador('ENVIAR MENSAGEM')
-    destinatario = input('Destinatário : ').strip()
-    conteudo     = input('Mensagem     : ').strip()
-
-    resp = _req(
-        'post', '/mensagem/enviar',
-        headers=cabecalho(),
-        json={'destinatario': destinatario, 'conteudo': conteudo}
-    )
-    if resp is None:
-        return
-
-    dados = resp.json()
-    if resp.status_code == 200:
-        print(f'\n  Enviado em {dados["timestamp"]}')
-        print(f'  Tamanho cifrado no servidor: {dados["bytes_cifrados"]} bytes')
-    else:
-        print(f'\n  [ERRO] {dados.get("erro")}')
-
-
-def ler_caixa_de_entrada():
-    if not token_sessao:
-        print('\n  Faça login primeiro.')
-        return
-
-    resp = _req('get', '/mensagem/caixa-de-entrada', headers=cabecalho())
-    if resp is None:
-        return
-
-    dados = resp.json()
-    if resp.status_code != 200:
-        print(f'\n  [ERRO] {dados.get("erro")}')
-        return
-
-    mensagens = dados['mensagens']
-    separador(f'CAIXA DE ENTRADA — {usuario_atual} ({dados["total"]} mensagem(ns))')
-
-    if not mensagens:
-        print('  Nenhuma mensagem.')
-        return
-
-    for m in mensagens:
-        icone = '[ nova ]' if m['lida'] == 0 else '[  lida ]'
-        print(f'\n  {icone}  De: {m["remetente"]}  |  {m["timestamp"]}')
-        print(f'           {m["conteudo"]}')
-
-
-def ver_enviadas():
-    if not token_sessao:
-        print('\n  Faça login primeiro.')
-        return
-
-    resp = _req('get', '/mensagem/enviadas', headers=cabecalho())
-    if resp is None:
-        return
-
-    dados = resp.json()
-    if resp.status_code != 200:
-        print(f'\n  [ERRO] {dados.get("erro")}')
-        return
-
-    enviadas = dados['enviadas']
-    separador(f'MENSAGENS ENVIADAS — {usuario_atual} ({dados["total"]})')
-
-    if not enviadas:
-        print('  Nenhuma mensagem enviada.')
-        return
-
-    for m in enviadas:
-        lida = 'lida' if m['lida'] else 'não lida'
-        print(f'  #{m["id"]:03d}  Para: {m["destinatario"]:12}  {m["timestamp"]}  [{lida}]')
-
-
-def ler_todas_mensagens():
-    if not token_sessao:
-        print('\n  Faça login primeiro.')
-        return
-
-    resp = _req('get', '/mensagem/todas', headers=cabecalho())
-    if resp is None:
-        return
-
-    dados = resp.json()
-    if resp.status_code != 200:
-        print(f'\n  [ACESSO NEGADO] {dados.get("erro")}')
-        return
-
-    mensagens = dados['mensagens']
-    separador(f'TODAS AS MENSAGENS [ADMIN] — {dados["total"]} no total')
-
-    for m in mensagens:
-        lida = 'lida' if m['lida'] else 'não lida'
-        print(f'\n  #{m["id"]:03d}  {m["remetente"]} -> {m["destinatario"]}  |  {m["timestamp"]}  [{lida}]')
-        print(f'       {m["conteudo"]}')
-
-
-def cadastrar_usuario():
-    if not token_sessao:
-        print('\n  Faça login primeiro.')
-        return
-
-    separador('CADASTRAR USUÁRIO [ADMIN]')
-    novo_usr = input('Novo username     : ').strip()
-    senha    = input('Senha             : ').strip()
-    papel    = input('Papel (user/admin): ').strip() or 'user'
-
-    resp = _req(
-        'post', '/usuario/cadastrar',
-        headers=cabecalho(),
-        json={'username': novo_usr, 'senha': senha, 'papel': papel}
-    )
-    if resp is None:
-        return
-
-    dados = resp.json()
-    if resp.status_code == 200:
-        print(f'\n  {dados["mensagem"]}')
-    else:
-        print(f'\n  [ERRO] {dados.get("erro")}')
-
-
-def listar_usuarios():
-    if not token_sessao:
-        print('\n  Faça login primeiro.')
-        return
-
-    resp = _req('get', '/usuario/listar', headers=cabecalho())
-    if resp is None:
-        return
-
-    dados = resp.json()
-    if resp.status_code != 200:
-        print(f'\n  [ACESSO NEGADO] {dados.get("erro")}')
-        return
-
-    separador(f'USUÁRIOS CADASTRADOS  (sessões abertas: {dados["sessoes_abertas"]})')
-    print(f'  {"USERNAME":<15} {"PAPEL":<8} STATUS')
-    print(f'  {"-"*14} {"-"*7} ------')
-    for u in dados['usuarios']:
-        status = '● online' if u['sessao_ativa'] else '  offline'
-        print(f'  {u["username"]:<15} {u["papel"]:<8} {status}')
-
-
-# -------------------------------------------------------------------
-# Menu principal
-# -------------------------------------------------------------------
-
-OPCOES_BASE = {
-    '1': ('Login',                    fazer_login),
-    '2': ('Logout',                   fazer_logout),
-    '3': ('Enviar mensagem',          enviar_mensagem),
-    '4': ('Caixa de entrada',         ler_caixa_de_entrada),
-    '5': ('Mensagens enviadas',       ver_enviadas),
-    '0': ('Sair',                     None),
-}
-
-OPCOES_ADMIN = {
-    '6': ('Ver todas as mensagens  [admin]', ler_todas_mensagens),
-    '7': ('Cadastrar usuário       [admin]', cadastrar_usuario),
-    '8': ('Listar usuários         [admin]', listar_usuarios),
-}
-
-
-def menu():
+def menu_principal(client):
     while True:
-        print('\n' + '═' * 50)
-        print('  SISTEMA DE COMUNICAÇÃO SEGURA')
-        if usuario_atual:
-            print(f'  Sessão: {usuario_atual}  |  papel: {papel_atual}')
+        print(f"\n--- Menu ({client.username} | Papel: {client.role}) ---")
+        print("1. Enviar Mensagem")
+        print("2. Ler Minhas Mensagens")
+        
+        if client.role == "admin":
+            print("[ADMIN] 3. Ler TODAS as Mensagens do Sistema")
+            print("[ADMIN] 4. Cadastrar Novo Usuário")
+            print("[ADMIN] 5. Listar Usuários Ativos")
+            
+        print("6. Sair")
+        opcao = input("Escolha uma opção: ")
+
+        if opcao == "1":
+            dest = input("Destinatário: ")
+            msg = input("Mensagem: ")
+            res = client.send_message(dest, msg)
+            print(f"Resposta: {res.get('message', res.get('error'))}")
+            
+        elif opcao == "2":
+            res = client.read_my_messages()
+            if res.get("status") == "success":
+                print("\n=== Minhas Mensagens ===")
+                for m in res.get("messages", []):
+                    print(f"[{m['timestamp']}] De: {m['remetente']} -> Msg: {m['conteudo']}")
+            else:
+                print(f"Erro: {res.get('message')}")
+                
+        elif opcao == "3" and client.role == "admin":
+            res = client.admin_read_all()
+            if res.get("status") == "success":
+                print("\n=== Auditoria: Todas as Mensagens ===")
+                for m in res.get("messages", []):
+                    print(f"[{m['timestamp']}] {m['remetente']} para {m['destinatario']}: {m['conteudo']}")
+            else:
+                print(f"Erro: {res.get('message')}")
+                
+        elif opcao == "4" and client.role == "admin":
+            n_user = input("Novo Username: ")
+            n_pass = input("Nova Senha: ")
+            n_role = input("Papel (user/admin): ")
+            res = client.admin_register_user(n_user, n_pass, n_role)
+            print(f"Resposta: {res.get('message')}")
+            
+        elif opcao == "5" and client.role == "admin":
+            res = client.admin_list_active()
+            print(f"Usuários ativos em sessão: {res.get('active_users')}")
+            
+        elif opcao == "6":
+            break
         else:
-            print('  Sessão: não autenticado')
-        print('═' * 50)
+            print("Opção inválida ou não autorizada.")
 
-        opcoes = dict(OPCOES_BASE)
-        if papel_atual == 'admin':
-            opcoes.update(OPCOES_ADMIN)
+def main():
+    print("=== Cliente de Mensataria Segura Distribuída ===")
+    ip = input("Digite o IP do Servidor (ex: 192.168.1.50): ")
+    
+    client = SecureClient(ip, PORT)
+    try:
+        client.connect()
+    except Exception as e:
+        print(f"Não foi possível conectar ao servidor {ip}:{PORT}. Erro: {e}")
+        return
 
-        for k, (descricao, _) in sorted(opcoes.items()):
-            print(f'  [{k}] {descricao}')
-
-        escolha = input('\n  Escolha: ').strip()
-
-        if escolha == '0':
-            if token_sessao:
-                fazer_logout()
-            print('\n  Até logo.\n')
-            sys.exit(0)
-
-        if escolha in opcoes:
-            opcoes[escolha][1]()
+    # Loop de autenticação obrigatório
+    while True:
+        print("\n--- Tela de Login ---")
+        user = input("Usuário: ")
+        senha = input("Senha: ")
+        
+        res = client.login(user, senha)
+        if res.get("status") == "success":
+            print(f"\n[+] Login efetuado com sucesso! Token gerado.")
+            break
         else:
-            print('  Opção inválida.')
+            print(f"[-] Erro: {res.get('message')}")
+            cont = input("Tentar novamente? (s/n): ")
+            if cont.lower() != 's':
+                client.close()
+                return
 
+    try:
+        menu_principal(client)
+    finally:
+        client.close()
 
-if __name__ == '__main__':
-    print()
-    print('  ╔══════════════════════════════════════════════╗')
-    print('  ║     CLIENTE — COMUNICAÇÃO SEGURA  v1.0       ║')
-    print('  ║     Conectado em:', BASE_URL.ljust(27), '║')
-    print('  ╚══════════════════════════════════════════════╝')
-    menu()
+if __name__ == "__main__":
+    main()
